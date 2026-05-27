@@ -13,6 +13,15 @@ from .placeholder import decode_dsat_text, dsat_text_to_plain_string, validate_p
 from .utils import checksums
 
 QUOTE_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+# DAC source often prefixes dialogue with a face/voice cue, e.g. ５Ｂ「...」, １２Ｂ「...」, ５大Ａ「...」.
+# It is script control metadata, not translatable message text.
+DIALOGUE_CUE_RE = re.compile(r"^(?P<cue>[0-9０-９]{1,3}(?:大)?[A-ZＡ-Ｚ])(?P<text>[「『（(【〈《].*)$")
+# DAC runtime interpolation macro, e.g. {$.M}. Simple scalar macros can be
+# resolved to the displayed name in DSAT, then restored on rebuild.
+SIMPLE_RUNTIME_MACRO_RE = re.compile(r"\{\$\.(?P<name>[A-Za-z_]\w*)\}")
+ANY_RUNTIME_MACRO_RE = re.compile(r"\{\$\.[^}]+\}")
+SCALAR_ASSIGN_RE = re.compile(r'^\s*\$\.(?P<name>[A-Za-z_]\w*)\s*=\s*"(?P<val>(?:[^"\\]|\\.)*)"')
+SCALAR_DEFAULT_RE = re.compile(r'\?\s*\$\.(?P<name>[A-Za-z_]\w*)\s*=\s*"(?P<val>(?:[^"\\]|\\.)*)"')
 DSAT_META_RE = re.compile(r"#\s+(.*)$")
 DSAT_SRC_RE = re.compile(r"^○(?P<idx>\d+)○(?P<tag>[^○]+)○(?P<text>.*)$")
 DSAT_DST_RE = re.compile(r"^●(?P<idx>\d+)●(?P<tag>[^●]+)●(?P<text>.*)$")
@@ -52,11 +61,16 @@ class TextEntry:
     dialogue_group: str = ""
     arg_index: int = -1
     prefix: str = ""
+    cue_prefix: str = ""
     policy: str = "relocate"
     encoding: str = "cp932"
     ph_bytes: str = ""
     ph_hash: str = ""
     ph_display: str = ""
+    macro_refs: str = ""
+    macro_values: str = ""
+    macro_tokens: str = ""
+    macro_policy: str = ""
 
 
 def line_offsets(raw: bytes) -> list[tuple[int, bytes, bytes]]:
@@ -86,6 +100,84 @@ def compute_placeholder_info(text: str) -> tuple[str, str, str]:
     ph_display = ",".join(displays)
     h = hashlib.sha256(("|".join(xs)).encode("ascii")).hexdigest() if xs else ""
     return ph_bytes, h, ph_display
+
+
+def build_runtime_macro_map(decoded_dir: Path, encoding: str = "cp932") -> dict[str, str]:
+    """Collect simple scalar runtime variables such as $.M = "浅木"."""
+    values: dict[str, str] = {}
+    for fp in sorted(decoded_dir.glob("*")):
+        if not fp.is_file():
+            continue
+        try:
+            text = fp.read_bytes().decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        for line in text.splitlines():
+            for rx in (SCALAR_ASSIGN_RE, SCALAR_DEFAULT_RE):
+                m = rx.search(line)
+                if not m:
+                    continue
+                key = "$." + m.group("name")
+                val = unquote_script_string(m.group("val"))
+                if not val:
+                    continue
+                # Prefer the first stable scalar value. If a later assignment differs,
+                # leave the original mapping rather than flipping mid-export.
+                values.setdefault(key, val)
+    return values
+
+
+def resolve_runtime_macros_for_display(text: str, runtime_macros: dict[str, str] | None = None) -> tuple[str, str, str, str]:
+    """Replace simple runtime macros with their visible value for DSAT.
+
+    Example: 「なあ{$.M}」 -> 「なあ浅木」 with metadata refs=$.M.
+    Indexed/runtime expressions remain untouched and can be filtered separately.
+    """
+    runtime_macros = runtime_macros or {}
+    refs: list[str] = []
+    vals: list[str] = []
+    toks: list[str] = []
+
+    def repl(m: re.Match[str]) -> str:
+        key = "$." + m.group("name")
+        if key not in runtime_macros:
+            return m.group(0)
+        refs.append(key)
+        vals.append(runtime_macros[key])
+        toks.append(m.group(0))
+        return runtime_macros[key]
+
+    display = SIMPLE_RUNTIME_MACRO_RE.sub(repl, text)
+    return display, ",".join(refs), ",".join(vals), ",".join(toks)
+
+
+def restore_runtime_macros_for_script(text: str, entry: "TextEntry") -> str:
+    """Restore displayed simple macro values to original script macros.
+
+    Zero-edit rebuilds become byte-identical, while intentional edits that remove
+    the original display value are kept as literals.
+    """
+    if not entry.macro_tokens or not entry.macro_values:
+        return text
+    tokens = entry.macro_tokens.split(",")
+    values = entry.macro_values.split(",")
+    out = text
+    for token, value in zip(tokens, values):
+        if value:
+            out = out.replace(value, token, 1)
+    return out
+
+
+def has_unresolved_runtime_macro(text: str) -> bool:
+    return ANY_RUNTIME_MACRO_RE.search(text) is not None
+
+
+def is_dynamic_only_runtime_text(text: str) -> bool:
+    """True for runtime-only UI/expression lines that should not be translated."""
+    stripped = ANY_RUNTIME_MACRO_RE.sub("", text)
+    noise = set(" \t\r\n　《》「」『』【】[]（）()〈〉<>、。・…!！?？:：;；,.，/\\\"\'`")
+    stripped = "".join(ch for ch in stripped if ch not in noise)
+    return stripped == ""
 
 
 def build_script_ir(decoded_path: Path, source_encrypted: str, out_dir: Path, encoding: str = "cp932") -> dict:
@@ -178,8 +270,9 @@ def build_script_ir(decoded_path: Path, source_encrypted: str, out_dir: Path, en
     return ir
 
 
-def extract_entries_from_decoded(decoded_path: Path, source_encrypted: str, start_idx: int, encoding: str = "cp932") -> tuple[list[TextEntry], int]:
+def extract_entries_from_decoded(decoded_path: Path, source_encrypted: str, start_idx: int, encoding: str = "cp932", runtime_macros: dict[str, str] | None = None) -> tuple[list[TextEntry], int]:
     raw = decoded_path.read_bytes()
+    runtime_macros = runtime_macros or {}
     entries: list[TextEntry] = []
     idx = start_idx
     current_name_idx = ""
@@ -187,9 +280,10 @@ def extract_entries_from_decoded(decoded_path: Path, source_encrypted: str, star
     pending_name_entry: Optional[TextEntry] = None
     group_no = 0
 
-    def add(line_no: int, off: int, tag: str, text: str, kind: str, speaker: str = "", arg_index: int = -1, prefix: str = "") -> TextEntry:
+    def add(line_no: int, off: int, tag: str, text: str, kind: str, speaker: str = "", arg_index: int = -1, prefix: str = "", cue_prefix: str = "") -> TextEntry:
         nonlocal idx
-        ph_bytes, ph_hash, ph_display = compute_placeholder_info(text)
+        display_text, macro_refs, macro_values, macro_tokens = resolve_runtime_macros_for_display(text.strip(), runtime_macros)
+        ph_bytes, ph_hash, ph_display = compute_placeholder_info(display_text)
         e = TextEntry(
             idx=f"{idx:06d}",
             file=decoded_path.name,
@@ -198,14 +292,19 @@ def extract_entries_from_decoded(decoded_path: Path, source_encrypted: str, star
             line=line_no,
             off=f"0x{off:08X}",
             tag=tag,
-            text=text.strip(),
+            text=display_text,
             kind=kind,
             speaker=speaker,
             arg_index=arg_index,
             prefix=prefix,
+            cue_prefix=cue_prefix,
             ph_bytes=ph_bytes,
             ph_hash=ph_hash,
             ph_display=ph_display,
+            macro_refs=macro_refs,
+            macro_values=macro_values,
+            macro_tokens=macro_tokens,
+            macro_policy=("display_resolve_restore" if macro_refs else ""),
         )
         entries.append(e)
         idx += 1
@@ -261,10 +360,21 @@ def extract_entries_from_decoded(decoded_path: Path, source_encrypted: str, star
         if s.startswith(".") or s.startswith("$") or s.endswith(":"):
             continue
 
-        # Plain script line.
+        # Plain script line. Strip DAC dialogue cue prefixes such as
+        # ５Ｂ / ７Ｂ / １２Ａ / ５大Ａ from the translatable text.
+        # They are control metadata used by the engine for expression/voice style,
+        # and must be preserved separately and reinserted on rebuild.
         text = s
+        cue_prefix = ""
+        cue_m = DIALOGUE_CUE_RE.match(text)
+        if cue_m:
+            cue_prefix = cue_m.group("cue")
+            text = cue_m.group("text")
         if text:
-            e = add(line_no, off, "msg", text, "plain_line", speaker=current_speaker)
+            display_text, _, _, _ = resolve_runtime_macros_for_display(text, runtime_macros)
+            if has_unresolved_runtime_macro(display_text) and is_dynamic_only_runtime_text(display_text):
+                continue
+            e = add(line_no, off, "msg", text, "plain_line", speaker=current_speaker, cue_prefix=cue_prefix)
             if pending_name_entry is not None:
                 group = f"dlg_{group_no:06d}"
                 group_no += 1
@@ -303,6 +413,10 @@ def _write_dsat_file(path: Path, entries: list[TextEntry]) -> None:
                 meta.append(f"dialogue_group={e.dialogue_group}")
             if e.arg_index >= 0:
                 meta.append(f"arg={e.arg_index}")
+            if e.cue_prefix:
+                meta.append(f"cue={e.cue_prefix}")
+            if e.macro_refs:
+                meta += [f"macro_count={len(e.macro_refs.split(','))}", f"macro_refs={e.macro_refs}", f"macro_values={e.macro_values}", f"macro_policy={e.macro_policy}"]
             if e.ph_bytes:
                 meta += [f"ph_count={len(e.ph_bytes.split(','))}", f"ph_bytes={e.ph_bytes}", f"ph_display={e.ph_display}", "ph_policy=preserve", f"ph_hash={e.ph_hash}"]
             f.write("# " + " ".join(meta) + "\n")
@@ -484,28 +598,30 @@ def apply_text_to_decoded(decoded_dir: Path, text_dir: Path, output_decoded_dir:
                     continue
                 # Validate target encodes and placeholders are restorable before touching file.
                 target_plain = dsat_text_to_plain_string(target, encoding)
+                target_plain_for_script = restore_runtime_macros_for_script(target_plain, e)
                 if not allow_lengthen:
-                    old_len = len(patch["source"].encode(encoding, errors="strict"))
-                    new_len = len(decode_dsat_text(target, encoding))
+                    old_len = len(restore_runtime_macros_for_script(patch["source"], e).encode(encoding, errors="strict"))
+                    new_len = len(target_plain_for_script.encode(encoding, errors="strict"))
                     if new_len > old_len:
                         raise ValueError(f"in_place length overflow idx={e.idx}: {new_len}>{old_len}")
                 if e.kind == "speaker_call":
                     prefix = new_line[:new_line.find(new_line.strip())] if new_line.strip() else ""
-                    new_line = prefix + ".call 台詞 " + target_plain
+                    new_line = prefix + ".call 台詞 " + target_plain_for_script
                 elif e.kind == "subtitle":
                     prefix = e.prefix or ".call set_subtitle "
                     leading = new_line[:len(new_line) - len(new_line.lstrip())]
-                    new_line = leading + prefix.strip() + " " + target_plain
+                    new_line = leading + prefix.strip() + " " + target_plain_for_script
                 elif e.kind in {"choice_arg", "quoted_arg", "quoted_assignment"}:
                     matches = list(QUOTE_RE.finditer(new_line))
                     if e.arg_index < 0 or e.arg_index >= len(matches):
                         raise ValueError(f"quoted arg index not found idx={e.idx} file={fname} line={line_no}")
                     m = matches[e.arg_index]
-                    q = quote_script_string(target_plain)
+                    q = quote_script_string(target_plain_for_script)
                     new_line = new_line[:m.start()] + q + new_line[m.end():]
                 elif e.kind == "plain_line":
                     leading = new_line[:len(new_line) - len(new_line.lstrip())]
-                    new_line = leading + target_plain
+                    cue = e.cue_prefix or ""
+                    new_line = leading + cue + target_plain_for_script
                 else:
                     raise ValueError(f"unsupported entry kind idx={e.idx}: {e.kind}")
                 changed += 1

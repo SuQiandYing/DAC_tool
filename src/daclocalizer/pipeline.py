@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .dpk import unpack_dpk, repack_dpk
 from .dacz import auto_decode_script, encode_with_profile_id, is_candidate_script_name, load_profiles
-from .textio import build_script_ir, extract_entries_from_decoded, write_entries, apply_text_to_decoded, TextEntry, dsat_filename_for_source
+from .textio import build_script_ir, build_runtime_macro_map, extract_entries_from_decoded, write_entries, apply_text_to_decoded, TextEntry, dsat_filename_for_source
 from .utils import checksums, verify_files, ensure_clean_dir
 
 SCRIPT_EXTS = {".dacz", ".iniz", ".dac", ".ini"}
@@ -211,10 +211,6 @@ def disasm_project(dpk_path: Path, workspace: Path, encoding: str = "cp932", cle
             decode_error = {"offset": e.start, "reason": e.reason}
 
         build_script_ir(dec_path, src.name, dirs["ir_by_source"], encoding)
-        entries: list[TextEntry] = []
-        if text_ok:
-            entries, next_idx = extract_entries_from_decoded(dec_path, src.name, next_idx, encoding)
-            all_entries.extend(entries)
 
         script_manifest.append({
             "source_encrypted": src.name,
@@ -227,11 +223,30 @@ def disasm_project(dpk_path: Path, workspace: Path, encoding: str = "cp932", cle
             "key": (None if auto.key is None else f"0x{auto.key:02X}"),
             "text_decode_ok": text_ok,
             "decode_error": decode_error,
-            "text_entries": len(entries),
+            "text_entries": 0,
             "preserve_exact": False,
             "encrypted_checksums": checksums(enc),
             "decoded_checksums": checksums(dec),
         })
+
+    # Resolve runtime name macros only after all scripts are decoded, because
+    # definitions such as $.M = "浅木" live in main.dac but are referenced elsewhere.
+    runtime_macros = build_runtime_macro_map(dirs["decoded_scripts"], encoding)
+    for srec in script_manifest:
+        if srec.get("preserve_exact") or not srec.get("text_decode_ok"):
+            continue
+        dec_path = dirs["decoded_scripts"] / srec["decoded_file"]
+        if not dec_path.exists():
+            continue
+        entries, next_idx = extract_entries_from_decoded(dec_path, srec["source_encrypted"], next_idx, encoding, runtime_macros=runtime_macros)
+        all_entries.extend(entries)
+        srec["text_entries"] = len(entries)
+
+    macro_report = {
+        "resolved_scalar_macros": runtime_macros,
+        "policy": "simple runtime macros like {$.M} are displayed as resolved names in DSAT and restored on rebuild; unresolved pure runtime expressions are skipped from translation files"
+    }
+    (dirs["reports"] / "runtime_macro_report.json").write_text(json.dumps(macro_report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     _write_global_ir(workspace, dpk_path, vfs, script_manifest, all_entries, encoding)
     pm = {
@@ -290,6 +305,28 @@ def export_text_project(workspace: Path) -> dict:
     # Keep canonical entry manifest beside human DSAT for importer compatibility.
     if entries_path.exists():
         shutil.copy2(entries_path, dirs["texts"] / "text_entries.jsonl")
+
+    # Report runtime macro handling so accidental {$.M}-style leakage is visible.
+    macro_entries = [e for e in entries if getattr(e, "macro_refs", "")]
+    macro_report = {
+        "resolved_macro_entries": len(macro_entries),
+        "resolved_macro_refs": {},
+        "unresolved_macro_literals_in_dsat": 0,
+        "unresolved_samples": [],
+        "policy": "simple scalar runtime name macros are displayed as names in DSAT and restored to original {$.X} macro on rebuild; dynamic-only runtime expressions are not exported as translatable text",
+    }
+    for e in macro_entries:
+        for ref, val in zip(e.macro_refs.split(","), e.macro_values.split(",")):
+            if not ref:
+                continue
+            macro_report["resolved_macro_refs"].setdefault(ref, {"display": val, "count": 0})["count"] += 1
+    for fp in sorted(dirs["texts_by_source"].glob("*.dsat.txt")):
+        for line_no, line in enumerate(fp.read_text(encoding="utf-8").splitlines(), 1):
+            if "{$." in line:
+                macro_report["unresolved_macro_literals_in_dsat"] += 1
+                if len(macro_report["unresolved_samples"]) < 20:
+                    macro_report["unresolved_samples"].append({"file": str(fp.relative_to(workspace)), "line": line_no, "text": line})
+    (dirs["reports"] / "macro_scan_report.json").write_text(json.dumps(macro_report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # Add no_text placeholders for every original script file.
     manifest = json.loads((dirs["ir"] / "source_manifest.json").read_text(encoding="utf-8"))
