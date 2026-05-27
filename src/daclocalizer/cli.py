@@ -8,6 +8,7 @@ from pathlib import Path
 from .dpk import unpack_dpk, repack_dpk
 from .pipeline import disasm_project, export_asm_project, export_text_project, export_project, import_and_repack, smoke_roundtrip, verify_project
 from .utils import verify_files
+from .dacz import load_profiles
 
 
 def main(argv=None) -> int:
@@ -58,6 +59,8 @@ def main(argv=None) -> int:
     p.add_argument("-o", "--out", type=Path, required=True)
     p.add_argument("--encoding", default="cp932")
 
+
+    p = sub.add_parser("profiles", help="List script crypto auto-detect profiles")
     p = sub.add_parser("verify", help="Stage 6: byte-level verify and hexdiff")
     p.add_argument("original", type=Path)
     p.add_argument("rebuilt", type=Path)
@@ -98,6 +101,18 @@ def main(argv=None) -> int:
         res = smoke_roundtrip(args.input, args.out, args.encoding)
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0 if res["ok"] else 1
+    if args.cmd == "profiles":
+        items = []
+        for prof in load_profiles():
+            items.append({
+                "profile_id": prof.profile_id,
+                "display_name": prof.display_name,
+                "algorithm": prof.algorithm,
+                "encrypted_exts": prof.encrypted_exts,
+                "min_score": prof.probe.get("min_score"),
+            })
+        print(json.dumps({"profiles": items}, ensure_ascii=False, indent=2))
+        return 0
     if args.cmd == "verify":
         out = args.out
         if out.suffix:

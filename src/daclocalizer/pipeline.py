@@ -7,12 +7,12 @@ import shutil
 from pathlib import Path
 
 from .dpk import unpack_dpk, repack_dpk
-from .dacz import derive_dacz_key, decrypt_dacz, encrypt_dacz, decoded_name_for
+from .dacz import auto_decode_script, encode_with_profile_id, is_candidate_script_name, load_profiles
 from .textio import build_script_ir, extract_entries_from_decoded, write_entries, apply_text_to_decoded, TextEntry, dsat_filename_for_source
 from .utils import checksums, verify_files, ensure_clean_dir
 
-SCRIPT_EXTS = {".dacz", ".iniz"}
-TOOL_VERSION = "brace-layout-1.0"
+SCRIPT_EXTS = {".dacz", ".iniz", ".dac", ".ini"}
+TOOL_VERSION = "auto-key-1.0"
 
 
 def _dirs(workspace: Path) -> dict[str, Path]:
@@ -48,7 +48,7 @@ def _write_workspace_docs(workspace: Path, encoding: str) -> None:
     mods.mkdir(parents=True, exist_ok=True)
     (workspace / "README_中文使用说明.md").write_text(f"""# DacDpkLocalizer 中文使用说明
 
-本工具用于 `script.dpk` 的拆包、DACZ/INIZ 脚本解密、IR/ASM/DSAT 导出、译文校验、重新加密与 DPK 动态回封。
+本工具用于 DPK 拆包、脚本加密层自动探测、IR/ASM/DSAT 导出、译文校验、重新加密与 DPK 动态回封。密钥不按单个游戏写死，而是由 profiles/ 中的脚本加密 profile 自动探测并按文件动态派生。
 
 ## 推荐工作流
 
@@ -89,7 +89,7 @@ GUI 支持拖入 `script.dpk` 或工作区目录来自动填充路径，但不�
     (docs / "工具分析与实现过程.md").write_text("""# 工具分析与实现过程
 
 1. DPK 层：识别 `DPK\0` 文件头，解出滚动 XOR 混淆索引，保留 VFS manifest 与原始物理顺序。
-2. DACZ 层：根据宿主程序中的静态逻辑，使用文件名与文件大小派生 key，再用固定 LCG 字节流解密。
+2. 脚本加密层：遍历 profiles/ 中的已知 profile，对候选脚本逐个尝试解码并评分；通过后记录 profile_id、动态派生 key 与探测分数。
 3. IR 层：解密后脚本为 DAC 源级脚本，因此采用行级 instruction IR，覆盖率仍为 100%。
 4. ASM 层：由 IR/decoded source 生成可读审计视图，不作为翻译主文件。
 5. DSAT 层：由 IR 投影生成，按源文件分流，翻译人员只编辑 `texts/by_source/`。
@@ -119,6 +119,7 @@ def _write_global_ir(workspace: Path, dpk_path: Path, vfs: dict, scripts: list[d
         "schema_version": "1.0.0",
         "tool_version": TOOL_VERSION,
         "source_dpk": str(dpk_path),
+        "crypto_profiles": [p.profile_id for p in load_profiles()],
         "encoding": encoding,
         "dpk_checksums": checksums(dpk_path.read_bytes()),
         "dpk_file_count": len(vfs["files"]),
@@ -133,7 +134,7 @@ def _write_global_ir(workspace: Path, dpk_path: Path, vfs: dict, scripts: list[d
             "filename": dpk_path.name,
             "encoding": encoding,
             "checksum": checksums(dpk_path.read_bytes()),
-            "cryptography": {"has_layer": True, "layer_stack": [{"algorithm": "DPK_ROLLING_XOR_INDEX"}, {"algorithm": "DACZ_LCG_STREAM"}]},
+            "cryptography": {"has_layer": True, "layer_stack": [{"algorithm": "DPK_ROLLING_XOR_INDEX"}, {"algorithm": "AUTO_SCRIPT_CRYPTO_PROFILE"}]},
         },
         "subresources": {
             "source_manifest": "source_manifest.json",
@@ -165,15 +166,38 @@ def disasm_project(dpk_path: Path, workspace: Path, encoding: str = "cp932", cle
     script_manifest: list[dict] = []
     next_idx = 0
 
+    profiles = load_profiles()
     for f in vfs["files"]:
         rel = f["local_relative_path"]
         src = dirs["dpk_extract"] / rel
-        if src.suffix.lower() not in SCRIPT_EXTS:
+        if not is_candidate_script_name(src.name, profiles):
             continue
         enc = src.read_bytes()
-        key = derive_dacz_key(src.name, len(enc), encoding)
-        dec = decrypt_dacz(enc, key)
-        dec_name = decoded_name_for(src.name)
+        auto = auto_decode_script(enc, src.name, encoding=encoding, profiles=profiles)
+
+        # Unknown/unsupported script crypto is preserved exactly and is not forced
+        # through the text pipeline. This keeps DPK handling generic while allowing
+        # known profiles to decode automatically from the DPK contents.
+        if auto.status not in {"decoded", "plain"}:
+            script_manifest.append({
+                "source_encrypted": src.name,
+                "decoded_file": auto.decoded_name,
+                "crypto_profile": auto.profile_id,
+                "decode_status": auto.status,
+                "probe_score": auto.score,
+                "probe_reason": auto.reason,
+                "key": None,
+                "text_decode_ok": False,
+                "decode_error": {"reason": auto.reason},
+                "text_entries": 0,
+                "preserve_exact": True,
+                "encrypted_checksums": checksums(enc),
+                "decoded_checksums": None,
+            })
+            continue
+
+        dec = auto.decoded
+        dec_name = auto.decoded_name
         dec_path = dirs["decoded_scripts"] / dec_name
         dec_path.parent.mkdir(parents=True, exist_ok=True)
         dec_path.write_bytes(dec)
@@ -195,10 +219,16 @@ def disasm_project(dpk_path: Path, workspace: Path, encoding: str = "cp932", cle
         script_manifest.append({
             "source_encrypted": src.name,
             "decoded_file": dec_name,
-            "key": f"0x{key:02X}",
+            "crypto_profile": auto.profile_id,
+            "crypto_profile_name": auto.profile_name,
+            "decode_status": auto.status,
+            "probe_score": auto.score,
+            "probe_reason": auto.reason,
+            "key": (None if auto.key is None else f"0x{auto.key:02X}"),
             "text_decode_ok": text_ok,
             "decode_error": decode_error,
             "text_entries": len(entries),
+            "preserve_exact": False,
             "encrypted_checksums": checksums(enc),
             "decoded_checksums": checksums(dec),
         })
@@ -209,6 +239,7 @@ def disasm_project(dpk_path: Path, workspace: Path, encoding: str = "cp932", cle
         "tool": "DacDpkLocalizer",
         "tool_version": TOOL_VERSION,
         "source_dpk": str(dpk_path),
+        "crypto_profiles": [p.profile_id for p in load_profiles()],
         "encoding": encoding,
         "directories": {
             "ir": "ir",
@@ -316,15 +347,30 @@ def import_and_repack(workspace: Path, dsat_path: Path, output_dpk: Path, encodi
     for s in pm["scripts"]:
         dec_file = s["decoded_file"]
         src_enc = s["source_encrypted"]
+        profile_id = s.get("crypto_profile")
+        if s.get("preserve_exact") or not profile_id or profile_id in {"none"}:
+            enc_report.append({"source_encrypted": src_enc, "crypto_profile": profile_id, "status": "preserve_exact"})
+            continue
         dec_path = patched_decoded / dec_file
         if not dec_path.exists():
             dec_path = decoded_dir / dec_file
         dec = dec_path.read_bytes()
-        key = derive_dacz_key(src_enc, len(dec), encoding)
-        enc = encrypt_dacz(dec, key)
+        if profile_id == "plain":
+            enc = dec
+            key = None
+        else:
+            enc, key = encode_with_profile_id(dec, src_enc, profile_id, encoding)
         out_path = patched_extract / src_enc
         out_path.write_bytes(enc)
-        enc_report.append({"source_encrypted": src_enc, "decoded_file": dec_file, "key": f"0x{key:02X}", "decoded_size": len(dec), "encrypted_size": len(enc), "encrypted_checksums": checksums(enc)})
+        enc_report.append({
+            "source_encrypted": src_enc,
+            "decoded_file": dec_file,
+            "crypto_profile": profile_id,
+            "key": (None if key is None else f"0x{key:02X}"),
+            "decoded_size": len(dec),
+            "encrypted_size": len(enc),
+            "encrypted_checksums": checksums(enc),
+        })
 
     output_dpk.parent.mkdir(parents=True, exist_ok=True)
     repack_report = repack_dpk(patched_extract, output_dpk)
