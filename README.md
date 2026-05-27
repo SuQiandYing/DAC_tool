@@ -10,12 +10,6 @@ DPK/DACZ 本地化工具。支持 DPK 解包、回封，脚本解密、分文件
 python run_gui.py
 ```
 
-Windows 可双击：
-
-```text
-启动GUI.bat
-```
-
 常用操作：
 
 - 素材包：`解包DPK` → 编辑 `workspace/unpack/` → `回封解包目录`
