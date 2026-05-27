@@ -2,18 +2,12 @@
 
 DPK/DACZ 本地化工具。支持 DPK 解包/回封、脚本加密层自动探测、分文件 DSAT 双行文本导出、导入回封、零编辑校验和加长回封。
 
-重点：工具不再把某个游戏的脚本密钥写死在流程里。`生成IR` 时会读取 `profiles/*.json`，对 DPK 内候选脚本逐个尝试已知加密 profile，按解码结果评分，成功后在 IR 中记录 `crypto_profile`、动态派生的 `key` 和 `probe_score`。回封时按记录的 profile 与新文件大小重新派生 key。
+`生成IR` 时会读取 `profiles/*.json`，对 DPK 内候选脚本逐个尝试已知加密 profile，按解码结果评分，成功后在 IR 中记录 `crypto_profile`、动态派生的 `key` 和 `probe_score`。回封时按记录的 profile 与新文件大小重新派生 key。
 
 ## GUI
 
 ```bash
 python run_gui.py
-```
-
-Windows 可双击：
-
-```text
-启动GUI.bat
 ```
 
 常用操作：
